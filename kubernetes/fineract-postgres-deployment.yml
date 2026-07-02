@@ -1,0 +1,151 @@
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: fineract-postgres-pv
+  labels:
+    type: local
+spec:
+  storageClassName: manual
+  capacity:
+    storage: 10Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: "/mnt/data/postgres"
+
+---
+
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: fineract-postgres-pvc
+spec:
+  storageClassName: manual
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    app: fineract-server
+  name: fineract-postgres
+spec:
+  ports:
+    - protocol: TCP
+      port: 5432
+      targetPort: 5432
+  selector:
+    app: fineract-server
+    tier: fineract-postgres
+  clusterIP: None
+
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: fineract-postgres-initdb
+data:
+  01-init.sh: |
+    #!/bin/bash
+    set -e
+    export PGPASSWORD=$POSTGRES_PASSWORD;
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" <<-EOSQL
+      CREATE USER $FINERACT_DB_USER WITH PASSWORD '$FINERACT_DB_PASS';
+      CREATE DATABASE $FINERACT_TENANTS_DB_NAME;
+      CREATE DATABASE $FINERACT_TENANT_DEFAULT_DB_NAME;
+      GRANT ALL PRIVILEGES ON DATABASE $FINERACT_TENANTS_DB_NAME TO $FINERACT_DB_USER;
+      GRANT ALL PRIVILEGES ON DATABASE $FINERACT_TENANT_DEFAULT_DB_NAME TO $FINERACT_DB_USER;
+      \c $FINERACT_TENANTS_DB_NAME
+      GRANT ALL ON SCHEMA public TO $FINERACT_DB_USER;
+      \c $FINERACT_TENANT_DEFAULT_DB_NAME
+      GRANT ALL ON SCHEMA public TO $FINERACT_DB_USER;
+    EOSQL
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: fineract-server
+  name: fineract-postgres
+spec:
+  selector:
+    matchLabels:
+      app: fineract-server
+      tier: fineract-postgres
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: fineract-server
+        tier: fineract-postgres
+    spec:
+      containers:
+        - image: postgres:18.3
+          name: postgres
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "1000m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+          env:
+            - name: POSTGRES_USER
+              value: root
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: fineract-tenants-db-secret
+                  key: password
+            - name: FINERACT_DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: fineract-tenants-db-secret
+                  key: username
+            - name: FINERACT_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: fineract-tenants-db-secret
+                  key: password
+            - name: FINERACT_TENANTS_DB_NAME
+              value: fineract_tenants
+            - name: FINERACT_TENANT_DEFAULT_DB_NAME
+              value: fineract_default
+            - name: POSTGRES_DB
+              value: postgres
+          livenessProbe:
+            exec:
+              command: ["sh","-c","pg_isready -q -d postgres -U root"]
+            failureThreshold: 10
+            timeoutSeconds: 10
+          readinessProbe:
+            exec:
+              command: ["sh","-c","pg_isready -q -d postgres -U root"]
+            failureThreshold: 10
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          ports:
+            - containerPort: 5432
+              name: fineractpg
+          volumeMounts:
+            - name: fineract-postgres-initdb
+              mountPath: /docker-entrypoint-initdb.d/
+            - name: fineract-postgres-persistent-storage
+              mountPath: /var/lib/postgresql
+      volumes:
+        - name: fineract-postgres-initdb
+          configMap:
+            name: fineract-postgres-initdb
+        - name: fineract-postgres-persistent-storage
+          persistentVolumeClaim:
+            claimName: fineract-postgres-pvc
